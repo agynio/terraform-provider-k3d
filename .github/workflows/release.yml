@@ -1,17 +1,13 @@
-# This GitHub action can publish assets for release when a tag is created.
-# Currently its setup to run on any tag that matches the pattern "v*" (ie. v0.1.0).
-#
-# GPG signing is optional:
-# - If GPG_PRIVATE_KEY and PASSPHRASE secrets are set, we import the key and sign.
-# - If not set, we skip signing and still build/upload artifacts.
-#
 name: release
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 jobs:
   goreleaser:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
