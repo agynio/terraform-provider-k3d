@@ -49,5 +49,7 @@ signs:
       - '{{ .Env.GPG_FINGERPRINT }}'
       - --detach-sign
       - --armor
+      - -o
+      - '{{ .Signature }}'
       - '{{ .ArtifactPath }}'
     artifacts: checksum
