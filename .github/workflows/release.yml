@@ -33,7 +33,7 @@ jobs:
         if: ${{ secrets.GPG_PRIVATE_KEY != '' && secrets.PASSPHRASE != '' }}
         uses: goreleaser/goreleaser-action@v5
         with:
-          version: latest
+          version: v1.24.0
           args: release --rm-dist --config .goreleaser.yaml
         env:
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
@@ -42,7 +42,7 @@ jobs:
         if: ${{ secrets.GPG_PRIVATE_KEY == '' || secrets.PASSPHRASE == '' }}
         uses: goreleaser/goreleaser-action@v5
         with:
-          version: latest
+          version: v1.24.0
           args: release --rm-dist --config .goreleaser.yaml --skip=sign
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
