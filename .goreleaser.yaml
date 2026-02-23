@@ -19,16 +19,13 @@ builds:
     goarch:
       - amd64
       - arm64
-    # Binary name inside the archive; ensure single 'v' and tag usage for releases
     binary: '{{ if .IsSnapshot }}terraform-provider-{{ .ProjectName }}_v{{ .Version }}{{ else }}terraform-provider-{{ .ProjectName }}_{{ .Tag }}{{ end }}'
 
 archives:
   - format: zip
-    # Ensure filename has a single 'v' for releases; use snapshot version for snapshots
     name_template: '{{ if .IsSnapshot }}terraform-provider-{{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ else }}terraform-provider-{{ .ProjectName }}_{{ .Tag }}_{{ .Os }}_{{ .Arch }}{{ end }}'
 
 checksum:
-  # Single 'v' on releases; snapshot uses its version template
   name_template: '{{ if .IsSnapshot }}terraform-provider-{{ .ProjectName }}_v{{ .Version }}_SHA256SUMS{{ else }}terraform-provider-{{ .ProjectName }}_{{ .Tag }}_SHA256SUMS{{ end }}'
   algorithm: sha256
 
@@ -40,6 +37,8 @@ changelog:
 
 signs:
   - id: checksum
+    artifacts: checksum
+    signature: '${artifact}.sig'
     cmd: gpg
     args:
       - --batch
@@ -49,7 +48,6 @@ signs:
       - '{{ .Env.GPG_FINGERPRINT }}'
       - --detach-sign
       - --armor
-      - -o
-      - '{{ .Signature }}'
-      - '{{ .ArtifactPath }}'
-    artifacts: checksum
+      - --output
+      - '${signature}'
+      - '${artifact}'
