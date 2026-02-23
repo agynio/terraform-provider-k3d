@@ -29,12 +29,20 @@ jobs:
         with:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
           passphrase: ${{ secrets.PASSPHRASE }}
-      - name: Run GoReleaser
+      - name: Run GoReleaser (with signing)
+        if: ${{ secrets.GPG_PRIVATE_KEY != '' && secrets.PASSPHRASE != '' }}
         uses: goreleaser/goreleaser-action@v5
         with:
           version: latest
           args: release --rm-dist --config .goreleaser.yaml
         env:
-          # Set fingerprint only if import_gpg ran; otherwise empty and signing is skipped
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run GoReleaser (skip signing)
+        if: ${{ secrets.GPG_PRIVATE_KEY == '' || secrets.PASSPHRASE == '' }}
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          version: latest
+          args: release --rm-dist --config .goreleaser.yaml --skip=sign
+        env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
