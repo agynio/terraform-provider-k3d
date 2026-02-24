@@ -48,7 +48,6 @@ signs:
       - --pinentry-mode
       - loopback
       - --detach-sign
-      - --armor
       - --output
       - '${signature}'
       - '${artifact}'
