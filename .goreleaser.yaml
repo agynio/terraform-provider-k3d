@@ -49,3 +49,7 @@ signs:
       - --output
       - '${signature}'
       - '${artifact}'
+
+release:
+  draft: false
+
