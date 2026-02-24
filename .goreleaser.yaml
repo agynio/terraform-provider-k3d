@@ -19,14 +19,17 @@ builds:
     goarch:
       - amd64
       - arm64
-    binary: '{{ if .IsSnapshot }}terraform-provider-{{ .ProjectName }}_v{{ .Version }}{{ else }}terraform-provider-{{ .ProjectName }}_{{ .Tag }}{{ end }}'
+    # Binary name inside the archive; use version without leading 'v'
+    binary: 'terraform-provider-{{ .ProjectName }}_{{ .Version }}'
 
 archives:
   - format: zip
-    name_template: '{{ if .IsSnapshot }}terraform-provider-{{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ else }}terraform-provider-{{ .ProjectName }}_{{ .Tag }}_{{ .Os }}_{{ .Arch }}{{ end }}'
+    # Filename uses version without leading 'v'
+    name_template: 'terraform-provider-{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
 
 checksum:
-  name_template: '{{ if .IsSnapshot }}terraform-provider-{{ .ProjectName }}_v{{ .Version }}_SHA256SUMS{{ else }}terraform-provider-{{ .ProjectName }}_{{ .Tag }}_SHA256SUMS{{ end }}'
+  # Checksum filename uses version without leading 'v'
+  name_template: 'terraform-provider-{{ .ProjectName }}_{{ .Version }}_SHA256SUMS'
   algorithm: sha256
 
 snapshot:
@@ -52,4 +55,3 @@ signs:
 
 release:
   draft: false
-
