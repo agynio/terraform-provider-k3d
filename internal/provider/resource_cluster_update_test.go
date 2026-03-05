@@ -7,7 +7,9 @@ import (
 
 	"github.com/docker/go-connections/nat"
 	"github.com/k3d-io/k3d/v5/pkg/config/v1alpha5"
+	"github.com/k3d-io/k3d/v5/pkg/runtimes"
 	"github.com/k3d-io/k3d/v5/pkg/types"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 func TestDeterminePortUpdatePlan_LoadBalancerChange(t *testing.T) {
@@ -156,9 +158,7 @@ func TestEnsureKubeAPIPublishedRestoresBinding(t *testing.T) {
 		Settings: types.LoadBalancerSettings{},
 	}
 
-	if err := ensureKubeAPIPublished(target, reference); err != nil {
-		t.Fatalf("ensureKubeAPIPublished failed: %v", err)
-	}
+	ensureKubeAPIPublished(context.Background(), target, reference)
 
 	bindings, ok := target.ServerLoadBalancer.Node.Ports[types.DefaultAPIPort]
 	if !ok || len(bindings) == 0 {
@@ -178,6 +178,47 @@ func TestEnsureKubeAPIPublishedRestoresBinding(t *testing.T) {
 
 	if targets[0] != "k3d-test-server-0" {
 		t.Fatalf("expected kube API target k3d-test-server-0, got %v", targets)
+	}
+}
+
+func TestEnsureKubeAPIPublishedFallsBackToKubeconfig(t *testing.T) {
+	ctx := context.Background()
+	actual := testClusterFixture()
+	actual.ServerLoadBalancer.Node.Ports = nat.PortMap{}
+	actual.KubeAPI = nil
+
+	target := testClusterFixture()
+	delete(target.ServerLoadBalancer.Node.Ports, types.DefaultAPIPort)
+	target.KubeAPI = nil
+
+	original := kubeconfigGet
+	defer func() { kubeconfigGet = original }()
+
+	clusterID := fmt.Sprintf("%s-%s", types.DefaultObjectNamePrefix, actual.Name)
+	cfg := clientcmdapi.NewConfig()
+	cfg.Clusters = map[string]*clientcmdapi.Cluster{
+		clusterID: {
+			Server: "https://192.168.5.10:16443",
+		},
+	}
+
+	kubeconfigGet = func(context.Context, runtimes.Runtime, *types.Cluster) (*clientcmdapi.Config, error) {
+		return cfg, nil
+	}
+
+	ensureKubeAPIPublished(ctx, target, actual)
+
+	bindings, ok := target.ServerLoadBalancer.Node.Ports[types.DefaultAPIPort]
+	if !ok || len(bindings) == 0 {
+		t.Fatalf("kube API binding should be restored from kubeconfig")
+	}
+
+	binding := bindings[0]
+	if binding.HostPort != "16443" {
+		t.Fatalf("expected kube API host port 16443, got %s", binding.HostPort)
+	}
+	if binding.HostIP != "192.168.5.10" {
+		t.Fatalf("expected kube API host IP 192.168.5.10, got %s", binding.HostIP)
 	}
 }
 

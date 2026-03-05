@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"sort"
 
 	"github.com/docker/go-connections/nat"
@@ -15,6 +16,7 @@ import (
 	"github.com/mitchellh/copystructure"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
 	"sigs.k8s.io/yaml"
 
 	"github.com/k3d-io/k3d/v5/cmd/util"
@@ -25,6 +27,8 @@ import (
 	"github.com/k3d-io/k3d/v5/pkg/types"
 	"github.com/k3d-io/k3d/v5/version"
 )
+
+var kubeconfigGet = client.KubeconfigGet
 
 func resourceCluster() *schema.Resource {
 
@@ -704,9 +708,7 @@ func buildClusterPortProjection(ctx context.Context, reference *types.Cluster, p
 	}
 
 	resetClusterPortState(clone, reference)
-	if err := ensureKubeAPIPublished(clone, reference); err != nil {
-		return nil, fmt.Errorf("failed to ensure kube API binding: %w", err)
-	}
+	ensureKubeAPIPublished(ctx, clone, reference)
 
 	if len(ports) == 0 {
 		return clone, nil
@@ -716,9 +718,7 @@ func buildClusterPortProjection(ctx context.Context, reference *types.Cluster, p
 		return nil, fmt.Errorf("failed to apply port configuration: %w", err)
 	}
 
-	if err := ensureKubeAPIPublished(clone, reference); err != nil {
-		return nil, fmt.Errorf("failed to ensure kube API binding: %w", err)
-	}
+	ensureKubeAPIPublished(ctx, clone, reference)
 	return clone, nil
 }
 
@@ -775,9 +775,9 @@ func resetClusterPortState(target *types.Cluster, reference *types.Cluster) {
 	}
 }
 
-func ensureKubeAPIPublished(cluster *types.Cluster, reference *types.Cluster) error {
+func ensureKubeAPIPublished(ctx context.Context, cluster *types.Cluster, actual *types.Cluster) {
 	if cluster == nil || cluster.ServerLoadBalancer == nil || cluster.ServerLoadBalancer.Node == nil {
-		return nil
+		return
 	}
 
 	lbNode := cluster.ServerLoadBalancer.Node
@@ -786,26 +786,47 @@ func ensureKubeAPIPublished(cluster *types.Cluster, reference *types.Cluster) er
 	}
 
 	binding := []nat.PortBinding{}
-	if existing, ok := lbNode.Ports[types.DefaultAPIPort]; ok && len(existing) > 0 {
-		binding = copyPortBindings(existing)
-	}
 
-	if len(binding) == 0 && reference != nil && reference.ServerLoadBalancer != nil && reference.ServerLoadBalancer.Node != nil {
-		if refBindings, ok := reference.ServerLoadBalancer.Node.Ports[types.DefaultAPIPort]; ok && len(refBindings) > 0 {
-			binding = copyPortBindings(refBindings)
+	if actual != nil && actual.ServerLoadBalancer != nil && actual.ServerLoadBalancer.Node != nil {
+		if existing, ok := actual.ServerLoadBalancer.Node.Ports[types.DefaultAPIPort]; ok && len(existing) > 0 {
+			binding = copyPortBindings(existing)
 		}
 	}
 
 	if len(binding) == 0 {
-		if reference != nil && reference.KubeAPI != nil {
-			binding = append(binding, reference.KubeAPI.Binding)
-		} else if cluster.KubeAPI != nil {
-			binding = append(binding, cluster.KubeAPI.Binding)
+		if existing, ok := lbNode.Ports[types.DefaultAPIPort]; ok && len(existing) > 0 {
+			binding = copyPortBindings(existing)
 		}
 	}
 
 	if len(binding) == 0 {
-		return fmt.Errorf("unable to determine kube API binding for load balancer")
+		if kubeconfigBinding, ok := kubeAPIBindingFromKubeconfig(ctx, actual); ok {
+			binding = []nat.PortBinding{kubeconfigBinding}
+		}
+	}
+
+	if len(binding) == 0 {
+		if actual != nil && actual.KubeAPI != nil {
+			binding = []nat.PortBinding{actual.KubeAPI.Binding}
+		} else if cluster != nil && cluster.KubeAPI != nil {
+			binding = []nat.PortBinding{cluster.KubeAPI.Binding}
+		}
+	}
+
+	if len(binding) == 0 {
+		binding = []nat.PortBinding{{
+			HostIP:   "0.0.0.0",
+			HostPort: types.DefaultAPIPort,
+		}}
+	}
+
+	for i := range binding {
+		if binding[i].HostIP == "" {
+			binding[i].HostIP = "0.0.0.0"
+		}
+		if binding[i].HostPort == "" {
+			binding[i].HostPort = types.DefaultAPIPort
+		}
 	}
 
 	lbNode.Ports[types.DefaultAPIPort] = copyPortBindings(binding)
@@ -821,8 +842,8 @@ func ensureKubeAPIPublished(cluster *types.Cluster, reference *types.Cluster) er
 
 	portKey := fmt.Sprintf("%s.tcp", types.DefaultAPIPort)
 	servers := collectServerNames(cluster)
-	if len(servers) == 0 && reference != nil && reference.ServerLoadBalancer != nil && reference.ServerLoadBalancer.Config != nil {
-		if refTargets, ok := reference.ServerLoadBalancer.Config.Ports[portKey]; ok && len(refTargets) > 0 {
+	if len(servers) == 0 && actual != nil && actual.ServerLoadBalancer != nil && actual.ServerLoadBalancer.Config != nil {
+		if refTargets, ok := actual.ServerLoadBalancer.Config.Ports[portKey]; ok && len(refTargets) > 0 {
 			servers = append([]string(nil), refTargets...)
 		}
 	}
@@ -831,16 +852,73 @@ func ensureKubeAPIPublished(cluster *types.Cluster, reference *types.Cluster) er
 	}
 
 	if lbConfig.Settings == (types.LoadBalancerSettings{}) {
-		if reference != nil && reference.ServerLoadBalancer != nil && reference.ServerLoadBalancer.Config != nil {
-			lbConfig.Settings = reference.ServerLoadBalancer.Config.Settings
+		if actual != nil && actual.ServerLoadBalancer != nil && actual.ServerLoadBalancer.Config != nil {
+			lbConfig.Settings = actual.ServerLoadBalancer.Config.Settings
 		} else {
 			lbConfig.Settings = types.LoadBalancerSettings{
 				WorkerConnections: types.DefaultLoadbalancerWorkerConnections,
 			}
 		}
 	}
+}
 
-	return nil
+func kubeAPIBindingFromKubeconfig(ctx context.Context, actual *types.Cluster) (nat.PortBinding, bool) {
+	if actual == nil {
+		return nat.PortBinding{}, false
+	}
+
+	cfg, err := kubeconfigGet(ctx, runtimes.SelectedRuntime, actual)
+	if err != nil {
+		log.Printf("[WARN] failed to retrieve kubeconfig for cluster %s: %v", actual.Name, err)
+		return nat.PortBinding{}, false
+	}
+
+	binding, err := kubeAPIBindingFromConfig(actual.Name, cfg)
+	if err != nil {
+		log.Printf("[WARN] failed to derive kube API binding from kubeconfig for cluster %s: %v", actual.Name, err)
+		return nat.PortBinding{}, false
+	}
+
+	log.Printf("[WARN] falling back to kubeconfig server endpoint for kube API binding on cluster %s (%s:%s)", actual.Name, binding.HostIP, binding.HostPort)
+
+	return binding, true
+}
+
+func kubeAPIBindingFromConfig(clusterName string, cfg *clientcmdapi.Config) (nat.PortBinding, error) {
+	if cfg == nil {
+		return nat.PortBinding{}, fmt.Errorf("kubeconfig is nil")
+	}
+
+	clusterID := fmt.Sprintf("%s-%s", types.DefaultObjectNamePrefix, clusterName)
+
+	clusterEntry, ok := cfg.Clusters[clusterID]
+	if !ok || clusterEntry == nil {
+		return nat.PortBinding{}, fmt.Errorf("cluster %s not found in kubeconfig", clusterID)
+	}
+
+	if clusterEntry.Server == "" {
+		return nat.PortBinding{}, fmt.Errorf("cluster %s server endpoint is empty", clusterID)
+	}
+
+	serverURL, err := url.Parse(clusterEntry.Server)
+	if err != nil {
+		return nat.PortBinding{}, fmt.Errorf("failed to parse server endpoint %q: %w", clusterEntry.Server, err)
+	}
+
+	host := serverURL.Hostname()
+	if host == "" {
+		host = "0.0.0.0"
+	}
+
+	port := serverURL.Port()
+	if port == "" {
+		port = types.DefaultAPIPort
+	}
+
+	return nat.PortBinding{
+		HostIP:   host,
+		HostPort: port,
+	}, nil
 }
 func collectServerNames(cluster *types.Cluster) []string {
 	if cluster == nil {
@@ -1018,9 +1096,7 @@ func prepareLoadBalancerReplacement(ctx context.Context, actual *types.Cluster, 
 		return nil, types.LoadbalancerConfig{}, fmt.Errorf("cluster does not have a load balancer")
 	}
 
-	if err := ensureKubeAPIPublished(desired, actual); err != nil {
-		return nil, types.LoadbalancerConfig{}, fmt.Errorf("failed to ensure kube API binding on desired load balancer: %w", err)
-	}
+	ensureKubeAPIPublished(ctx, desired, actual)
 	replacement, err := client.CopyNode(ctx, actual.ServerLoadBalancer.Node, client.CopyNodeOpts{})
 	if err != nil {
 		return nil, types.LoadbalancerConfig{}, fmt.Errorf("failed to copy load balancer node: %w", err)
