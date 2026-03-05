@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"log"
 	"sort"
-	"strconv"
-	"strings"
 
 	"github.com/docker/go-connections/nat"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
@@ -439,8 +437,23 @@ func resourceCluster() *schema.Resource {
 	}
 }
 
-func getSimpleConfig(d *schema.ResourceData) *v1alpha5.SimpleConfig {
+func getSimpleConfig(d *schema.ResourceData) (*v1alpha5.SimpleConfig, error) {
 	clusterName := d.Get("name").(string)
+
+	portRaw := d.Get("port")
+	var portList []interface{}
+	if portRaw != nil {
+		var ok bool
+		portList, ok = portRaw.([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("unexpected type for port attribute: %T", portRaw)
+		}
+	}
+
+	ports, err := expandPorts(portList)
+	if err != nil {
+		return nil, err
+	}
 
 	// TODO: validate all values with GetOk
 	simpleConfig := &v1alpha5.SimpleConfig{
@@ -453,7 +466,7 @@ func getSimpleConfig(d *schema.ResourceData) *v1alpha5.SimpleConfig {
 		ExposeAPI:    expandExposureOptions(d.Get("kube_api").([]interface{})),
 		Image:        d.Get("image").(string),
 		Network:      d.Get("network").(string),
-		Ports:        expandPorts(d.Get("port").([]interface{})),
+		Ports:        ports,
 		Servers:      d.Get("servers").(int),
 		//Subnet:       d.Get("subnet").(string),
 		Volumes: expandVolumes(d.Get("volume").([]interface{})),
@@ -493,7 +506,7 @@ func getSimpleConfig(d *schema.ResourceData) *v1alpha5.SimpleConfig {
 		simpleConfig.Registries.Use = use
 	}
 
-	return simpleConfig
+	return simpleConfig, nil
 }
 
 func getClusterConfig(ctx context.Context, simpleConfig v1alpha5.SimpleConfig) (*v1alpha5.ClusterConfig, error) {
@@ -521,7 +534,10 @@ func getClusterConfig(ctx context.Context, simpleConfig v1alpha5.SimpleConfig) (
 func resourceClusterCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	clusterName := d.Get("name").(string)
 
-	simpleConfig := getSimpleConfig(d)
+	simpleConfig, err := getSimpleConfig(d)
+	if err != nil {
+		return diag.FromErr(err)
+	}
 
 	clusterConfig, err := getClusterConfig(ctx, *simpleConfig)
 	if err != nil {
@@ -597,8 +613,15 @@ func resourceClusterUpdate(ctx context.Context, d *schema.ResourceData, meta int
 	}
 
 	oldRaw, newRaw := d.GetChange("port")
-	oldPorts := expandPortsFromRaw(oldRaw)
-	newPorts := expandPortsFromRaw(newRaw)
+	oldPorts, err := expandPortsFromRaw(oldRaw)
+	if err != nil {
+		return diag.FromErr(fmt.Errorf("failed to parse previous port configuration: %w", err))
+	}
+
+	newPorts, err := expandPortsFromRaw(newRaw)
+	if err != nil {
+		return diag.FromErr(fmt.Errorf("failed to parse desired port configuration: %w", err))
+	}
 
 	oldProjection, err := buildClusterPortProjection(ctx, cluster, oldPorts)
 	if err != nil {
@@ -628,7 +651,10 @@ func resourceClusterDelete(ctx context.Context, d *schema.ResourceData, meta int
 		return diag.FromErr(err)
 	}
 
-	simpleConfig := getSimpleConfig(d)
+	simpleConfig, err := getSimpleConfig(d)
+	if err != nil {
+		return diag.FromErr(err)
+	}
 
 	clusterConfig, err := getClusterConfig(ctx, *simpleConfig)
 	if err != nil {
@@ -649,14 +675,18 @@ type portUpdatePlan struct {
 	nodeNames    []string
 }
 
-func expandPortsFromRaw(raw interface{}) []v1alpha5.PortWithNodeFilters {
+func expandPortsFromRaw(raw interface{}) ([]v1alpha5.PortWithNodeFilters, error) {
 	if raw == nil {
-		return nil
+		return nil, nil
 	}
 
 	list, ok := raw.([]interface{})
-	if !ok || len(list) == 0 {
-		return nil
+	if !ok {
+		return nil, fmt.Errorf("unexpected type for port diff: %T", raw)
+	}
+
+	if len(list) == 0 {
+		return nil, nil
 	}
 
 	return expandPorts(list)
@@ -1148,66 +1178,90 @@ func expandNodeFilters(l []interface{}) []string {
 	return filters
 }
 
-func expandPorts(l []interface{}) []v1alpha5.PortWithNodeFilters {
-	if len(l) == 0 || l[0] == nil {
-		return nil
+func expandPorts(l []interface{}) ([]v1alpha5.PortWithNodeFilters, error) {
+	if len(l) == 0 {
+		return nil, nil
+	}
+	if len(l) == 1 && l[0] == nil {
+		return nil, nil
 	}
 
 	ports := make([]v1alpha5.PortWithNodeFilters, 0, len(l))
-	for _, i := range l {
-		if i == nil {
-			continue
+	for idx, item := range l {
+		if item == nil {
+			return nil, fmt.Errorf("port[%d]: expected object, got nil", idx)
 		}
-		v := i.(map[string]interface{})
+
+		entry, ok := item.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("port[%d]: expected object, got %T", idx, item)
+		}
 
 		host := ""
-		if rawHost, ok := v["host"]; ok && rawHost != nil {
-			host = rawHost.(string)
-		}
-
-		protocol := ""
-		if rawProtocol, ok := v["protocol"]; ok && rawProtocol != nil {
-			protocol = rawProtocol.(string)
+		if value, exists := entry["host"]; exists {
+			if value == nil {
+				host = ""
+			} else {
+				str, ok := value.(string)
+				if !ok {
+					return nil, fmt.Errorf("port[%d].host: expected string, got %T", idx, value)
+				}
+				host = str
+			}
 		}
 
 		hostPort := 0
-		if rawHostPort, ok := v["host_port"]; ok && rawHostPort != nil {
-			hostPort = rawHostPort.(int)
+		if value, exists := entry["host_port"]; exists {
+			if value != nil {
+				num, ok := value.(int)
+				if !ok {
+					return nil, fmt.Errorf("port[%d].host_port: expected number, got %T", idx, value)
+				}
+				hostPort = num
+			}
 		}
 
-		containerPort := v["container_port"].(int)
+		containerValue, exists := entry["container_port"]
+		if !exists || containerValue == nil {
+			return nil, fmt.Errorf("port[%d].container_port: missing value", idx)
+		}
 
-		var rawFilters []interface{}
-		if filters, ok := v["node_filters"]; ok && filters != nil {
-			rawFilters, _ = filters.([]interface{})
+		containerPort, ok := containerValue.(int)
+		if !ok {
+			return nil, fmt.Errorf("port[%d].container_port: expected number, got %T", idx, containerValue)
+		}
+
+		protocol := ""
+		if value, exists := entry["protocol"]; exists {
+			if value == nil {
+				protocol = ""
+			} else {
+				str, ok := value.(string)
+				if !ok {
+					return nil, fmt.Errorf("port[%d].protocol: expected string, got %T", idx, value)
+				}
+				protocol = str
+			}
+		}
+
+		var filtersList []interface{}
+		if value, exists := entry["node_filters"]; exists {
+			if value != nil {
+				list, ok := value.([]interface{})
+				if !ok {
+					return nil, fmt.Errorf("port[%d].node_filters: expected list, got %T", idx, value)
+				}
+				filtersList = list
+			}
 		}
 
 		ports = append(ports, v1alpha5.PortWithNodeFilters{
-			Port:        formatPortSpec(host, hostPort, containerPort, protocol),
-			NodeFilters: expandNodeFilters(rawFilters),
+			Port:        fmt.Sprintf("%s:%d:%d/%s", host, hostPort, containerPort, protocol),
+			NodeFilters: expandNodeFilters(filtersList),
 		})
 	}
 
-	return ports
-}
-
-func formatPortSpec(host string, hostPort int, containerPort int, protocol string) string {
-	segments := make([]string, 0, 3)
-	if host != "" {
-		segments = append(segments, host)
-	}
-	if host != "" || hostPort != 0 {
-		segments = append(segments, strconv.Itoa(hostPort))
-	}
-	segments = append(segments, strconv.Itoa(containerPort))
-
-	spec := strings.Join(segments, ":")
-	proto := strings.ToLower(protocol)
-	if proto != "" {
-		spec = fmt.Sprintf("%s/%s", spec, proto)
-	}
-
-	return spec
+	return ports, nil
 }
 
 func expandVolumes(l []interface{}) []v1alpha5.VolumeWithNodeFilters {

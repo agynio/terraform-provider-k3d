@@ -97,6 +97,23 @@ func TestDeterminePortUpdatePlan_NoChanges(t *testing.T) {
 	}
 }
 
+func TestExpandPortsFromRawRejectsUnexpectedShape(t *testing.T) {
+	if _, err := expandPortsFromRaw(map[string]interface{}{}); err == nil {
+		t.Fatal("expected error for non-slice raw value")
+	}
+}
+
+func TestExpandPortsRejectsMalformedEntry(t *testing.T) {
+	_, err := expandPorts([]interface{}{
+		map[string]interface{}{
+			"host": "127.0.0.1",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for missing container_port")
+	}
+}
+
 func testClusterFixture() *types.Cluster {
 	apiPort := nat.Port(fmt.Sprintf("%s/tcp", types.DefaultAPIPort))
 	apiBinding := nat.PortBinding{
