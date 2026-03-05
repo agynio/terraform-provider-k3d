@@ -704,6 +704,9 @@ func buildClusterPortProjection(ctx context.Context, reference *types.Cluster, p
 	}
 
 	resetClusterPortState(clone, reference)
+	if err := ensureKubeAPIPublished(clone, reference); err != nil {
+		return nil, fmt.Errorf("failed to ensure kube API binding: %w", err)
+	}
 
 	if len(ports) == 0 {
 		return clone, nil
@@ -713,6 +716,9 @@ func buildClusterPortProjection(ctx context.Context, reference *types.Cluster, p
 		return nil, fmt.Errorf("failed to apply port configuration: %w", err)
 	}
 
+	if err := ensureKubeAPIPublished(clone, reference); err != nil {
+		return nil, fmt.Errorf("failed to ensure kube API binding: %w", err)
+	}
 	return clone, nil
 }
 
@@ -769,6 +775,73 @@ func resetClusterPortState(target *types.Cluster, reference *types.Cluster) {
 	}
 }
 
+func ensureKubeAPIPublished(cluster *types.Cluster, reference *types.Cluster) error {
+	if cluster == nil || cluster.ServerLoadBalancer == nil || cluster.ServerLoadBalancer.Node == nil {
+		return nil
+	}
+
+	lbNode := cluster.ServerLoadBalancer.Node
+	if lbNode.Ports == nil {
+		lbNode.Ports = nat.PortMap{}
+	}
+
+	binding := []nat.PortBinding{}
+	if existing, ok := lbNode.Ports[types.DefaultAPIPort]; ok && len(existing) > 0 {
+		binding = copyPortBindings(existing)
+	}
+
+	if len(binding) == 0 && reference != nil && reference.ServerLoadBalancer != nil && reference.ServerLoadBalancer.Node != nil {
+		if refBindings, ok := reference.ServerLoadBalancer.Node.Ports[types.DefaultAPIPort]; ok && len(refBindings) > 0 {
+			binding = copyPortBindings(refBindings)
+		}
+	}
+
+	if len(binding) == 0 {
+		if reference != nil && reference.KubeAPI != nil {
+			binding = append(binding, reference.KubeAPI.Binding)
+		} else if cluster.KubeAPI != nil {
+			binding = append(binding, cluster.KubeAPI.Binding)
+		}
+	}
+
+	if len(binding) == 0 {
+		return fmt.Errorf("unable to determine kube API binding for load balancer")
+	}
+
+	lbNode.Ports[types.DefaultAPIPort] = copyPortBindings(binding)
+
+	lbConfig := cluster.ServerLoadBalancer.Config
+	if lbConfig == nil {
+		lbConfig = &types.LoadbalancerConfig{}
+		cluster.ServerLoadBalancer.Config = lbConfig
+	}
+	if lbConfig.Ports == nil {
+		lbConfig.Ports = map[string][]string{}
+	}
+
+	portKey := fmt.Sprintf("%s.tcp", types.DefaultAPIPort)
+	servers := collectServerNames(cluster)
+	if len(servers) == 0 && reference != nil && reference.ServerLoadBalancer != nil && reference.ServerLoadBalancer.Config != nil {
+		if refTargets, ok := reference.ServerLoadBalancer.Config.Ports[portKey]; ok && len(refTargets) > 0 {
+			servers = append([]string(nil), refTargets...)
+		}
+	}
+	if len(servers) > 0 {
+		lbConfig.Ports[portKey] = append([]string(nil), servers...)
+	}
+
+	if lbConfig.Settings == (types.LoadBalancerSettings{}) {
+		if reference != nil && reference.ServerLoadBalancer != nil && reference.ServerLoadBalancer.Config != nil {
+			lbConfig.Settings = reference.ServerLoadBalancer.Config.Settings
+		} else {
+			lbConfig.Settings = types.LoadBalancerSettings{
+				WorkerConnections: types.DefaultLoadbalancerWorkerConnections,
+			}
+		}
+	}
+
+	return nil
+}
 func collectServerNames(cluster *types.Cluster) []string {
 	if cluster == nil {
 		return nil
@@ -925,13 +998,32 @@ func applyPortUpdatePlan(ctx context.Context, actual *types.Cluster, desired *ty
 }
 
 func replaceLoadBalancer(ctx context.Context, actual *types.Cluster, desired *types.Cluster) error {
-	if actual.ServerLoadBalancer == nil || desired.ServerLoadBalancer == nil {
-		return fmt.Errorf("cluster does not have a load balancer")
+	replacement, lbConfig, err := prepareLoadBalancerReplacement(ctx, actual, desired)
+	if err != nil {
+		return err
 	}
 
+	if err := client.NodeReplace(ctx, runtimes.SelectedRuntime, actual.ServerLoadBalancer.Node, replacement); err != nil {
+		return fmt.Errorf("failed to replace load balancer node: %w", err)
+	}
+
+	actual.ServerLoadBalancer.Node = replacement
+	actual.ServerLoadBalancer.Config = &lbConfig
+
+	return nil
+}
+
+func prepareLoadBalancerReplacement(ctx context.Context, actual *types.Cluster, desired *types.Cluster) (*types.Node, types.LoadbalancerConfig, error) {
+	if actual.ServerLoadBalancer == nil || desired.ServerLoadBalancer == nil {
+		return nil, types.LoadbalancerConfig{}, fmt.Errorf("cluster does not have a load balancer")
+	}
+
+	if err := ensureKubeAPIPublished(desired, actual); err != nil {
+		return nil, types.LoadbalancerConfig{}, fmt.Errorf("failed to ensure kube API binding on desired load balancer: %w", err)
+	}
 	replacement, err := client.CopyNode(ctx, actual.ServerLoadBalancer.Node, client.CopyNodeOpts{})
 	if err != nil {
-		return fmt.Errorf("failed to copy load balancer node: %w", err)
+		return nil, types.LoadbalancerConfig{}, fmt.Errorf("failed to copy load balancer node: %w", err)
 	}
 
 	replacement.Ports = copyPortMap(desired.ServerLoadBalancer.Node.Ports)
@@ -939,12 +1031,12 @@ func replaceLoadBalancer(ctx context.Context, actual *types.Cluster, desired *ty
 
 	lbConfig, err := client.LoadbalancerGenerateConfig(desired)
 	if err != nil {
-		return fmt.Errorf("failed to generate load balancer config: %w", err)
+		return nil, types.LoadbalancerConfig{}, fmt.Errorf("failed to generate load balancer config: %w", err)
 	}
 
 	configyaml, err := yaml.Marshal(lbConfig)
 	if err != nil {
-		return fmt.Errorf("failed to marshal load balancer config: %w", err)
+		return nil, types.LoadbalancerConfig{}, fmt.Errorf("failed to marshal load balancer config: %w", err)
 	}
 
 	replacement.HookActions = append(replacement.HookActions, types.NodeHook{
@@ -958,14 +1050,7 @@ func replaceLoadBalancer(ctx context.Context, actual *types.Cluster, desired *ty
 		},
 	})
 
-	if err := client.NodeReplace(ctx, runtimes.SelectedRuntime, actual.ServerLoadBalancer.Node, replacement); err != nil {
-		return fmt.Errorf("failed to replace load balancer node: %w", err)
-	}
-
-	actual.ServerLoadBalancer.Node = replacement
-	actual.ServerLoadBalancer.Config = &lbConfig
-
-	return nil
+	return replacement, lbConfig, nil
 }
 
 func filterLoadbalancerConfigHooks(hooks []types.NodeHook) []types.NodeHook {
