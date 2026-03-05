@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/docker/go-connections/nat"
@@ -94,6 +95,91 @@ func TestDeterminePortUpdatePlan_NoChanges(t *testing.T) {
 	}
 	if len(plan.nodeNames) != 0 {
 		t.Fatalf("did not expect node updates, got %v", plan.nodeNames)
+	}
+}
+
+func TestBuildClusterPortProjectionRetainsKubeAPI(t *testing.T) {
+	cluster := testClusterFixture()
+	ctx := context.Background()
+
+	ports := []v1alpha5.PortWithNodeFilters{
+		{Port: "8080:80/tcp", NodeFilters: []string{"loadbalancer"}},
+	}
+
+	projection, err := buildClusterPortProjection(ctx, cluster, ports)
+	if err != nil {
+		t.Fatalf("buildClusterPortProjection failed: %v", err)
+	}
+
+	bindings, ok := projection.ServerLoadBalancer.Node.Ports[types.DefaultAPIPort]
+	if !ok || len(bindings) == 0 {
+		t.Fatalf("kube API port %s missing from load balancer ports", types.DefaultAPIPort)
+	}
+
+	expectedBinding := cluster.KubeAPI.Binding
+	if bindings[0].HostPort != expectedBinding.HostPort {
+		t.Fatalf("expected kube API host port %s, got %s", expectedBinding.HostPort, bindings[0].HostPort)
+	}
+	if bindings[0].HostIP != expectedBinding.HostIP {
+		t.Fatalf("expected kube API host IP %s, got %s", expectedBinding.HostIP, bindings[0].HostIP)
+	}
+
+	portKey := fmt.Sprintf("%s.tcp", types.DefaultAPIPort)
+	targets, ok := projection.ServerLoadBalancer.Config.Ports[portKey]
+	if !ok || len(targets) == 0 {
+		t.Fatalf("kube API port %s missing from load balancer config", portKey)
+	}
+	if targets[0] != "k3d-test-server-0" {
+		t.Fatalf("expected server target k3d-test-server-0, got %v", targets)
+	}
+}
+
+func TestEnsureKubeAPIPublishedRestoresBinding(t *testing.T) {
+	reference := testClusterFixture()
+	target := testClusterFixture()
+
+	delete(target.ServerLoadBalancer.Node.Ports, types.DefaultAPIPort)
+	target.ServerLoadBalancer.Config = &types.LoadbalancerConfig{
+		Ports:    map[string][]string{},
+		Settings: types.LoadBalancerSettings{},
+	}
+
+	ensureKubeAPIPublished(target, reference)
+
+	bindings, ok := target.ServerLoadBalancer.Node.Ports[types.DefaultAPIPort]
+	if !ok || len(bindings) == 0 {
+		t.Fatalf("kube API port %s not restored", types.DefaultAPIPort)
+	}
+
+	expected := reference.KubeAPI.Binding
+	if bindings[0] != expected {
+		t.Fatalf("expected binding %+v, got %+v", expected, bindings[0])
+	}
+
+	portKey := fmt.Sprintf("%s.tcp", types.DefaultAPIPort)
+	targets, ok := target.ServerLoadBalancer.Config.Ports[portKey]
+	if !ok || len(targets) == 0 {
+		t.Fatalf("load balancer config missing kube API targets for %s", portKey)
+	}
+
+	if targets[0] != "k3d-test-server-0" {
+		t.Fatalf("expected kube API target k3d-test-server-0, got %v", targets)
+	}
+}
+
+func TestReplaceLoadBalancerRequiresKubeAPIPort(t *testing.T) {
+	ctx := context.Background()
+	actual := testClusterFixture()
+	desired := testClusterFixture()
+	delete(desired.ServerLoadBalancer.Node.Ports, types.DefaultAPIPort)
+
+	err := replaceLoadBalancer(ctx, actual, desired)
+	if err == nil {
+		t.Fatal("expected error when kube API port missing")
+	}
+
+	if !strings.Contains(err.Error(), types.DefaultAPIPort) {
+		t.Fatalf("expected error to mention kube API port, got %v", err)
 	}
 }
 
