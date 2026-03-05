@@ -83,11 +83,7 @@ func resourceNodeCreate(ctx context.Context, d *schema.ResourceData, meta interf
 		Memory:  d.Get("memory").(string),
 	}
 
-	createOpts := types.NodeCreateOpts{
-		Wait: true,
-	}
-
-	if err := client.NodeAddToCluster(ctx, runtimes.SelectedRuntime, node, &types.Cluster{Name: clusterName}, createOpts); err != nil {
+	if err := client.NodeAddToCluster(ctx, runtimes.SelectedRuntime, node, &types.Cluster{Name: clusterName}, types.NodeCreateOpts{}); err != nil {
 		return diag.FromErr(err)
 	}
 
